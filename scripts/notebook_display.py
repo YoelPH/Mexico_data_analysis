@@ -67,3 +67,40 @@ def comparison_view(summary, labels=None):
         "disagreements": "Disagreements", "patients_affected": "Patients affected",
         "agreement_pct": "Agreement",
     })
+
+
+def show_disagreement_evidence(analysis):
+    """Shared main evidence and expandable parent/sublevel reconstruction trace."""
+    without, with_pathology = "max_llh_without_pathology", "max_llh_with_pathology"
+    cases = analysis["disagreements"]
+    view = cases[["patient_id", "recorded_consensus", "pathology", without, with_pathology]].copy()
+    view.insert(1, "Location", cases["side"] + " " + cases["level"])
+    view["Raw modalities"] = [
+        ", ".join(f"{name} {'+' if row[name] else '−'}" for name in ["CT", "MRI", "PET", "FNA"]
+                  if pd.notna(row[name]))
+        for _, row in cases.iterrows()
+    ]
+    view.insert(2, "Hierarchy", cases["hierarchy_changes"])
+    view = view.rename(columns={
+        "patient_id": "Patient", "recorded_consensus": "Recorded", "pathology": "Pathology",
+        without: "Without path.", with_pathology: "With path.",
+    })
+    show_table(view, binary=["Recorded", "Pathology", "Without path.", "With path."])
+
+    columns = ["patient_id", "side", "level", "recorded_consensus", "pathology",
+               "CT", "MRI", "PET", "FNA", without, with_pathology, "comments"]
+    full = analysis["all_disagreements"][columns].rename(columns={
+        "patient_id": "Patient", "side": "Side", "level": "Level", "comments": "Centre's comments",
+        **SOURCE_LABELS,
+    })
+    show_table(full, details="All disagreements, including individual modalities, and centre comments",
+               binary=["Recorded consensus", "Pathology", "CT", "MRI", "PET", "FNA",
+                       "Without pathology", "With pathology"])
+
+    sublevels = analysis["hierarchy_evidence"].copy()
+    if not sublevels.empty:
+        sublevels["source"] = sublevels["source"].replace(SOURCE_LABELS)
+        show_table(sublevels.rename(columns={
+            "patient_id": "Patient", "location": "Location", "source": "Source",
+            "stage": "Stage", "parent_value": "Parent", "sublevels": "Sublevels",
+        }), details="Parent and sublevel evidence: before and after hierarchy", binary=["Parent"])

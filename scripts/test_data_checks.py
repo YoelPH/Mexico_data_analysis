@@ -140,6 +140,59 @@ class DataChecksTest(unittest.TestCase):
         self.assertEqual(result.iloc[0]["stage_basis"], "pathological")
         self.assertEqual(result.iloc[1]["stage_basis"], "conflicting/invalid N prefix")
 
+    def test_individual_modality_disagreement_is_only_in_full_details(self):
+        raw = cohort({("CT", "contra", "III"): True,
+                      ("PET", "contra", "III"): False,
+                      ("diagnostic_consensus", "contra", "III"): False})
+        result = checks.analyse_dataset(raw)
+        self.assertEqual(len(result["all_disagreements"]), 1)
+        self.assertTrue(result["disagreements"].empty)
+        self.assertTrue(result["consensus_disagreements"].empty)
+
+    def test_consensus_and_pathology_disagreements_remain_in_main_table(self):
+        raw = cohort(
+            {("CT", "ipsi", "III"): True,
+             ("diagnostic_consensus", "ipsi", "III"): False},
+            {("CT", "ipsi", "III"): True, ("pathology", "ipsi", "III"): False,
+             ("diagnostic_consensus", "ipsi", "III"): True},
+        )
+        result = checks.analyse_dataset(raw)
+        self.assertEqual(result["consensus_disagreements"]["patient_id"].tolist(), ["P1", "P2"])
+
+    def test_positive_child_explains_parent_change_on_both_sides(self):
+        for side, parent, children in [("ipsi", "I", ("Ia", "Ib")),
+                                       ("contra", "II", ("IIa", "IIb"))]:
+            with self.subTest(side=side, parent=parent):
+                values = {("diagnostic_consensus", side, parent): False}
+                for modality in ("CT", "MRI", "PET", "FNA"):
+                    values.update({(modality, side, parent): False,
+                                   (modality, side, children[0]): False,
+                                   (modality, side, children[1]): True})
+                values.update({("pathology", side, level): False for level in (parent, *children)})
+                raw = cohort(values)
+                raw.index = pd.Index([37])
+                before_raw = raw.copy(deep=True)
+                result = checks.analyse_dataset(raw)
+                audit = result["reconstruction_hierarchy"]["max_llh_without_pathology"]
+                self.assertFalse(audit["before"].loc[37, (side, parent)])
+                self.assertTrue(audit["after"].loc[37, (side, parent)])
+                main = result["disagreements"].query("side == @side and level == @parent").iloc[0]
+                self.assertIn(f"{parent} − → +", main["hierarchy_changes"])
+                self.assertIn(f"{children[1]} +", main["hierarchy_changes"])
+                evidence = result["hierarchy_evidence"]
+                ct = evidence.loc[evidence["source"].eq("CT")].iloc[0]
+                self.assertFalse(ct["parent_value"])
+                self.assertIn(f"{children[1]} +", ct["sublevels"])
+                pd.testing.assert_frame_equal(raw, before_raw)
+
+    def test_hierarchy_audit_preserves_unknown_when_no_inputs_exist(self):
+        raw = cohort({("diagnostic_consensus", "ipsi", "I"): True})
+        results, _, hierarchy = checks.reconstruct(raw, return_hierarchy=True)
+        for name, stages in hierarchy.items():
+            self.assertTrue(results[name].isna().all().all())
+            self.assertTrue(stages["before"].isna().all().all())
+            self.assertTrue(stages["after"].isna().all().all())
+
 
 if __name__ == "__main__":
     unittest.main()
