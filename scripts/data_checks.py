@@ -1,24 +1,40 @@
-"""Shared, non-mutating data checks for every centre's standardized workbook.
-
-Use analyse_dataset(workbook) from any dataset notebook. All calculations live
-here; notebooks select a workbook and present the returned tables.
-"""
+"""Shared notebook analysis. Start with analyse_dataset(), then follow its helpers."""
 
 import numpy as np
 import pandas as pd
 import lydata  # Registers the pandas accessor.
 from lydata.utils import get_default_modalities
 
-from .sanity_checks import _boolean, _stage, run_sanity_checks
+from .sanity_checks import MAIN_LEVELS, SIDES, SUBDIVISIONS, _boolean, _stage, run_sanity_checks
 
 
-SIDES = ("ipsi", "contra")
-MAIN_LEVELS = ("I", "II", "III", "IV", "V", "VII")
 ALL_LEVELS = ("I", "Ia", "Ib", "II", "IIa", "IIb", "III", "IV", "V", "VII")
-SUBDIVISIONS = {"I": ("Ia", "Ib"), "II": ("IIa", "IIb")}
 MODALITIES = ("diagnostic_consensus", "pathology", "CT", "MRI", "PET", "FNA", "pCT")
 WITHOUT_PATHOLOGY = ("CT", "MRI", "PET", "pCT", "FNA")
 PAIR_COLUMNS = pd.MultiIndex.from_product([SIDES, MAIN_LEVELS], names=["side", "level"])
+
+
+def analyse_dataset(data):
+    """Run the four notebook analyses and return their tables. Input stays unchanged."""
+    raw = normalize_source(data)
+    hierarchy = hierarchy_conflicts(raw)
+    sanity = run_sanity_checks(raw, mode="reduced")
+    sources, consensus = _consensus_tables(raw)
+
+    return {
+        "raw": raw,
+        "pathology_without_neck_dissection": pathology_without_dissection(raw),
+        "missing_observations": missing_overview(raw),
+        "hierarchy_issues": hierarchy,
+        "sanity_issues": sanity,
+        "consistency_summary": pd.DataFrame({
+            "check": ["Main level vs sublevels", "Reduced sanity checks"],
+            "observations": [len(hierarchy), len(sanity)],
+            "patients_affected": [hierarchy["row"].nunique(), sanity["row"].nunique()],
+        }),
+        **consensus,
+        **_stage_tables(raw, sources),
+    }
 
 
 def normalize_source(data):
@@ -98,13 +114,17 @@ def missing_overview(raw):
     return pd.DataFrame(records)
 
 
-def hierarchy_conflicts(raw):
+def hierarchy_conflicts(raw, *, modalities=MODALITIES, subdivisions=SUBDIVISIONS):
+    """Check known parent/child contradictions for the requested sources and levels."""
+    levels = tuple(dict.fromkeys(
+        level for parent, children in subdivisions.items() for level in (parent, *children)
+    ))
     records = []
-    for modality in MODALITIES:
-        values = observations(raw, modality, ALL_LEVELS)
+    for modality in modalities:
+        values = observations(raw, modality, levels)
         for index, row in values.iterrows():
             for side in SIDES:
-                for parent, children in SUBDIVISIONS.items():
+                for parent, children in subdivisions.items():
                     p = row[(side, parent)]
                     child_values = [row[(side, child)] for child in children]
                     any_positive = any(pd.notna(v) and bool(v) for v in child_values)
@@ -123,7 +143,7 @@ def hierarchy_conflicts(raw):
     ])
 
 
-def reconstruct(raw, *, return_hierarchy=False):
+def reconstruct(raw):
     """Two max_llh estimates with identical settings except inclusion of pathology.
 
     Recorded diagnostic_consensus is excluded from both estimates. FNA is retained.
@@ -151,28 +171,40 @@ def reconstruct(raw, *, return_hierarchy=False):
             # lydata returns a positional RangeIndex even if source indices differ.
             combined.index = raw.index
             results[name] = combined.reindex(columns=PAIR_COLUMNS).astype("boolean")
-            if return_hierarchy:
-                before = inputs.ly.combine(modalities=configs, method="max_llh", subdivisions={})
-                before.index = raw.index
-                hierarchy[name] = {
-                    "before": before.reindex(columns=all_columns).astype("boolean"),
-                    "after": combined.reindex(columns=all_columns).astype("boolean"),
-                }
+            before = inputs.ly.combine(modalities=configs, method="max_llh", subdivisions={})
+            before.index = raw.index
+            hierarchy[name] = {
+                "before": before.reindex(columns=all_columns).astype("boolean"),
+                "after": combined.reindex(columns=all_columns).astype("boolean"),
+            }
         else:
             results[name] = pd.DataFrame(pd.NA, index=raw.index, columns=PAIR_COLUMNS, dtype="boolean")
-            if return_hierarchy:
-                empty = pd.DataFrame(pd.NA, index=raw.index, columns=all_columns, dtype="boolean")
-                hierarchy[name] = {"before": empty.copy(), "after": empty.copy()}
+            empty = pd.DataFrame(pd.NA, index=raw.index, columns=all_columns, dtype="boolean")
+            hierarchy[name] = {"before": empty.copy(), "after": empty.copy()}
     settings = pd.DataFrame([
         {"modality": name, "available": name in available,
          "sensitivity": defaults[name].sens, "specificity": defaults[name].spec}
         for name in (*WITHOUT_PATHOLOGY, "pathology")
     ])
-    return (results, settings, hierarchy) if return_hierarchy else (results, settings)
+    return results, settings, hierarchy
 
 
 def _symbol(value):
     return "—" if pd.isna(value) else "+" if bool(value) else "−"
+
+
+def _raw_modality_evidence(row, side, level, subdivisions=SUBDIVISIONS):
+    """Include known parent and sublevel observations, even without a parent label."""
+    evidence = []
+    for modality in WITHOUT_PATHOLOGY:
+        values = []
+        for source_level in (level, *subdivisions.get(level, ())):
+            value = _valid_observation(row.get((modality, side, source_level)))
+            if value is not None:
+                values.append(f"{source_level} {_symbol(value)}")
+        if values:
+            evidence.append(f"{modality} {', '.join(values)}")
+    return "; ".join(evidence) or "—"
 
 
 def _hierarchy_change_text(index, side, parent, hierarchy):
@@ -223,8 +255,9 @@ def comparison_summary(sources, comparisons, mask=None):
     return pd.DataFrame(records)
 
 
-def disagreement_details(raw, sources, comparisons, *, hierarchy=None):
-    """One evidence row per disputed patient/side/main-level, with no duplicate pairs."""
+def disagreement_details(raw, sources, comparisons, *, hierarchy=None,
+                         subdivisions=SUBDIVISIONS):
+    """One evidence row per disputed patient/side/level, with no duplicate pairs."""
     reasons = {}
     for left_name, right_name in comparisons:
         _, different = _paired(sources[left_name], sources[right_name])
@@ -232,18 +265,21 @@ def disagreement_details(raw, sources, comparisons, *, hierarchy=None):
             for column_position in np.flatnonzero(row):
                 reasons.setdefault((position, int(column_position)), []).append(f"{left_name} vs {right_name}")
     context = patient_context(raw)
+    pair_columns = next(iter(sources.values())).columns if sources else ()
     records = []
     for (position, column_position), pairs in sorted(reasons.items()):
-        side, level = PAIR_COLUMNS[column_position]
+        side, level = pair_columns[column_position]
         records.append({
             "row": raw.index[position],
             "patient_id": context.iloc[position]["patient_id"], "side": side, "level": level,
             **{name: values.iloc[position, column_position] for name, values in sources.items()},
+            "raw_modalities": _raw_modality_evidence(raw.iloc[position], side, level, subdivisions),
             "hierarchy_changes": _hierarchy_change_text(raw.index[position], side, level, hierarchy or {}),
             "disagreements": "; ".join(pairs), "comments": context.iloc[position]["comments"],
         })
     return pd.DataFrame(records, columns=[
-        "row", "patient_id", "side", "level", *sources, "hierarchy_changes", "disagreements", "comments",
+        "row", "patient_id", "side", "level", *sources, "raw_modalities",
+        "hierarchy_changes", "disagreements", "comments",
     ])
 
 
@@ -331,26 +367,8 @@ def n_stage_comparison(raw, sources):
     return pd.DataFrame(records)
 
 
-def analyse_dataset(data):
-    """Run the same four analyses for any standardized centre workbook.
-
-    No centre names, patient IDs, expected counts, or case-specific corrections
-    influence the calculations. Unknown/invalid observations are excluded from
-    comparisons and inference; invalid source values remain visible in the sanity
-    findings. All patients are retained. The input dataframe is never modified.
-    """
-    raw = normalize_source(data)
-    pathology_without_neck_dissection = pathology_without_dissection(raw)
-    missing_observations = missing_overview(raw)
-    hierarchy_issues = hierarchy_conflicts(raw)
-    sanity_issues = run_sanity_checks(raw, mode="reduced", stage_basis=None)
-    consistency_summary = pd.DataFrame([
-        {"check": "Main level vs sublevels", "observations": len(hierarchy_issues),
-         "patients_affected": hierarchy_issues["row"].nunique()},
-        {"check": "Reduced sanity checks", "observations": len(sanity_issues),
-         "patients_affected": sanity_issues["row"].nunique()},
-    ])
-
+def _consensus_tables(raw):
+    """Compare recorded, reconstructed and pathological labels on known pairs."""
     sources = {"recorded_consensus": observations(raw, "diagnostic_consensus")}
     sources.update({name: observations(raw, name)
                     for name in ["pathology", "CT", "MRI", "PET", "FNA", "pCT"]})
@@ -358,7 +376,7 @@ def analyse_dataset(data):
                        if name != "recorded_consensus"]
     recorded_vs_modalities = comparison_summary(sources, raw_comparisons)
 
-    reconstructed, modality_settings, reconstruction_hierarchy = reconstruct(raw, return_hierarchy=True)
+    reconstructed, modality_settings, reconstruction_hierarchy = reconstruct(raw)
     sources.update(reconstructed)
     without, with_pathology = "max_llh_without_pathology", "max_llh_with_pathology"
     reconstruction_comparisons = [
@@ -394,6 +412,22 @@ def analyse_dataset(data):
     )
     sublevel_evidence = hierarchy_evidence(raw, disagreements, reconstruction_hierarchy)
 
+    return sources, {
+        "recorded_vs_modalities": recorded_vs_modalities,
+        "modality_settings": modality_settings,
+        "reconstruction_summary": reconstruction_summary,
+        "matched_pathology_summary": matched_pathology_summary,
+        "reconstruction_changed": reconstruction_changed,
+        "interpretation_summary": interpretation_summary,
+        "disagreements": consensus_disagreements,
+        "all_disagreements": disagreements,
+        "hierarchy_evidence": sublevel_evidence,
+    }
+
+
+def _stage_tables(raw, sources):
+    """Summarize N-stage evidence and collect cases needing review."""
+    without, with_pathology = "max_llh_without_pathology", "max_llh_with_pathology"
     stage_sources = {name: sources[name] for name in
                      ["recorded_consensus", without, with_pathology, "pathology"]}
     n_stage_details = n_stage_comparison(raw, stage_sources)
@@ -421,16 +455,7 @@ def analyse_dataset(data):
     ].reset_index(drop=True)
 
     return {
-        "raw": raw, "pathology_without_neck_dissection": pathology_without_neck_dissection,
-        "missing_observations": missing_observations, "hierarchy_issues": hierarchy_issues,
-        "sanity_issues": sanity_issues, "consistency_summary": consistency_summary,
-        "sources": sources, "recorded_vs_modalities": recorded_vs_modalities,
-        "modality_settings": modality_settings, "reconstruction_summary": reconstruction_summary,
-        "matched_pathology_summary": matched_pathology_summary,
-        "reconstruction_changed": reconstruction_changed, "interpretation_summary": interpretation_summary,
-        "disagreements": consensus_disagreements, "all_disagreements": disagreements,
-        "consensus_disagreements": consensus_disagreements,
-        "reconstruction_hierarchy": reconstruction_hierarchy, "hierarchy_evidence": sublevel_evidence,
         "n_stage_details": n_stage_details,
-        "n_stage_overview": n_stage_overview, "n_stage_review": n_stage_review,
+        "n_stage_overview": n_stage_overview,
+        "n_stage_review": n_stage_review,
     }

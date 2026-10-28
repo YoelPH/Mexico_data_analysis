@@ -75,11 +75,7 @@ def show_disagreement_evidence(analysis):
     cases = analysis["disagreements"]
     view = cases[["patient_id", "recorded_consensus", "pathology", without, with_pathology]].copy()
     view.insert(1, "Location", cases["side"] + " " + cases["level"])
-    view["Raw modalities"] = [
-        ", ".join(f"{name} {'+' if row[name] else '−'}" for name in ["CT", "MRI", "PET", "FNA"]
-                  if pd.notna(row[name]))
-        for _, row in cases.iterrows()
-    ]
+    view["Raw modalities"] = cases["raw_modalities"]
     view.insert(2, "Hierarchy", cases["hierarchy_changes"])
     view = view.rename(columns={
         "patient_id": "Patient", "recorded_consensus": "Recorded", "pathology": "Pathology",

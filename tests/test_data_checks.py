@@ -1,10 +1,12 @@
 """Behavioral checks for the shared missingness and comparison rules."""
 
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
 from scripts import data_checks as checks
+from scripts import notebook_display as report
 
 
 def cohort(*overrides, complete_ct=False):
@@ -61,10 +63,23 @@ class DataChecksTest(unittest.TestCase):
         self.assertTrue(empty.empty)
         self.assertIn("row", empty.columns)
 
+    def test_hierarchy_can_check_final_consensus_and_additional_subdivisions(self):
+        raw = cohort(
+            {("max_llh", "contra", "V"): False, ("max_llh", "contra", "Va"): True},
+            {("max_llh", "contra", "V"): True, ("max_llh", "contra", "Va"): False},
+            {("max_llh", "contra", "V"): True, ("max_llh", "contra", "Va"): False,
+             ("max_llh", "contra", "Vb"): False},
+        )
+        result = checks.hierarchy_conflicts(
+            raw, modalities=("max_llh",), subdivisions={"V": ("Va", "Vb")},
+        )
+        self.assertEqual(result["patient_id"].tolist(), ["P1", "P3"])
+        self.assertEqual(result["level"].tolist(), ["V", "V"])
+
     def test_reconstruction_excludes_recorded_consensus_and_preserves_unknown(self):
         raw = cohort({("diagnostic_consensus", "ipsi", "III"): True})
         raw.index = pd.Index([42])
-        results, _ = checks.reconstruct(raw)
+        results, _, _ = checks.reconstruct(raw)
         for table in results.values():
             self.assertEqual(table.index.tolist(), [42])
             self.assertTrue(table.isna().all().all())
@@ -75,20 +90,49 @@ class DataChecksTest(unittest.TestCase):
                       ("diagnostic_consensus", "ipsi", "III"): False}, complete_ct=True)
         raw.index = pd.Index([37])
         before = raw.copy(deep=True)
-        results, _ = checks.reconstruct(raw)
+        results, _, _ = checks.reconstruct(raw)
         self.assertTrue(results["max_llh_without_pathology"].loc[37, ("ipsi", "III")])
         self.assertFalse(results["max_llh_with_pathology"].loc[37, ("ipsi", "III")])
         pd.testing.assert_frame_equal(raw, before)
         raw[("diagnostic_consensus", "ipsi", "III")] = True
-        changed_consensus, _ = checks.reconstruct(raw)
+        changed_consensus, _, _ = checks.reconstruct(raw)
         for name in results:
             pd.testing.assert_frame_equal(results[name], changed_consensus[name])
 
     def test_fna_is_retained_without_pathology(self):
         raw = cohort({("FNA", "contra", "III"): True})
-        results, _ = checks.reconstruct(raw)
+        results, _, _ = checks.reconstruct(raw)
         self.assertTrue(results["max_llh_without_pathology"].loc[0, ("contra", "III")])
         self.assertTrue(pd.isna(results["max_llh_without_pathology"].loc[0, ("ipsi", "III")]))
+
+    def test_sublevel_only_modality_is_visible_in_main_evidence(self):
+        for side, parent, children, modality in [
+            ("ipsi", "II", ("IIa", "IIb"), "FNA"),
+            ("contra", "I", ("Ia", "Ib"), "pCT"),
+        ]:
+            with self.subTest(side=side, parent=parent, modality=modality):
+                raw = cohort({
+                    ("diagnostic_consensus", side, parent): False,
+                    ("CT", side, parent): False,
+                    ("CT", side, children[0]): False,
+                    ("CT", side, children[1]): False,
+                    ("FNA", side, children[0]): True,
+                    (modality, side, children[0]): True,
+                })
+                raw.index = pd.Index([37])
+                before = raw.copy(deep=True)
+                result = checks.analyse_dataset(raw)
+                case = result["disagreements"].query("side == @side and level == @parent").iloc[0]
+                self.assertTrue(pd.isna(case[modality]))
+                for name in ("max_llh_without_pathology", "max_llh_with_pathology"):
+                    self.assertTrue(case[name])
+                self.assertIn(f"CT {parent} −", case["raw_modalities"])
+                self.assertIn(f"{modality} {children[0]} +", case["raw_modalities"])
+                with patch.object(report, "show_table") as show_table:
+                    report.show_disagreement_evidence(result)
+                displayed = show_table.call_args_list[0].args[0]
+                self.assertEqual(displayed.iloc[0]["Raw modalities"], case["raw_modalities"])
+                pd.testing.assert_frame_equal(raw, before)
 
     def test_only_known_pairs_count_and_disagreements_are_not_duplicated(self):
         raw = cohort({("CT", "ipsi", "I"): True, ("pathology", "ipsi", "I"): False},
@@ -102,6 +146,26 @@ class DataChecksTest(unittest.TestCase):
         self.assertTrue(pd.isna(summary.iloc[1]["agreement_pct"]))
         details = checks.disagreement_details(raw, sources, [("CT", "pathology"), ("pathology", "CT")])
         self.assertEqual(len(details), 1)
+
+    def test_disagreement_evidence_supports_sublevels_and_custom_hierarchy(self):
+        raw = cohort({("CT", "contra", "Va"): True,
+                      ("diagnostic_consensus", "contra", "Va"): False,
+                      ("CT", "contra", "V"): False,
+                      ("diagnostic_consensus", "contra", "V"): True})
+        raw.index = pd.Index([37])
+        sources = {
+            name: checks.observations(raw, name, levels=("V", "Va", "Vb"))
+            for name in ("CT", "diagnostic_consensus")
+        }
+        details = checks.disagreement_details(
+            raw, sources, [("CT", "diagnostic_consensus")],
+            subdivisions={"V": ("Va", "Vb")},
+        )
+        self.assertEqual(details["row"].tolist(), [37, 37])
+        self.assertEqual(details["side"].tolist(), ["contra", "contra"])
+        self.assertEqual(details["level"].tolist(), ["V", "Va"])
+        self.assertIn("Va +", details.iloc[0]["raw_modalities"])
+        self.assertEqual(details.iloc[1]["raw_modalities"], "CT Va +")
 
     def test_matched_pair_mask_and_index_validation(self):
         raw = cohort({("CT", "ipsi", "I"): True, ("MRI", "ipsi", "I"): False},
@@ -147,7 +211,6 @@ class DataChecksTest(unittest.TestCase):
         result = checks.analyse_dataset(raw)
         self.assertEqual(len(result["all_disagreements"]), 1)
         self.assertTrue(result["disagreements"].empty)
-        self.assertTrue(result["consensus_disagreements"].empty)
 
     def test_consensus_and_pathology_disagreements_remain_in_main_table(self):
         raw = cohort(
@@ -157,7 +220,7 @@ class DataChecksTest(unittest.TestCase):
              ("diagnostic_consensus", "ipsi", "III"): True},
         )
         result = checks.analyse_dataset(raw)
-        self.assertEqual(result["consensus_disagreements"]["patient_id"].tolist(), ["P1", "P2"])
+        self.assertEqual(result["disagreements"]["patient_id"].tolist(), ["P1", "P2"])
 
     def test_positive_child_explains_parent_change_on_both_sides(self):
         for side, parent, children in [("ipsi", "I", ("Ia", "Ib")),
@@ -173,7 +236,8 @@ class DataChecksTest(unittest.TestCase):
                 raw.index = pd.Index([37])
                 before_raw = raw.copy(deep=True)
                 result = checks.analyse_dataset(raw)
-                audit = result["reconstruction_hierarchy"]["max_llh_without_pathology"]
+                _, _, hierarchy = checks.reconstruct(raw)
+                audit = hierarchy["max_llh_without_pathology"]
                 self.assertFalse(audit["before"].loc[37, (side, parent)])
                 self.assertTrue(audit["after"].loc[37, (side, parent)])
                 main = result["disagreements"].query("side == @side and level == @parent").iloc[0]
@@ -187,7 +251,7 @@ class DataChecksTest(unittest.TestCase):
 
     def test_hierarchy_audit_preserves_unknown_when_no_inputs_exist(self):
         raw = cohort({("diagnostic_consensus", "ipsi", "I"): True})
-        results, _, hierarchy = checks.reconstruct(raw, return_hierarchy=True)
+        results, _, hierarchy = checks.reconstruct(raw)
         for name, stages in hierarchy.items():
             self.assertTrue(results[name].isna().all().all())
             self.assertTrue(stages["before"].isna().all().all())

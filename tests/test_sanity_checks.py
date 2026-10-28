@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from sanity_checks import MAIN_LEVELS, INCOMPLETE, REVIEW, run_sanity_checks
+from scripts.sanity_checks import MAIN_LEVELS, INCOMPLETE, REVIEW, run_sanity_checks
 
 
 def cohort(*overrides):
@@ -322,8 +322,6 @@ class UpdatedCohortSmokeTest(unittest.TestCase):
                 self.assertTrue(set(result["row"]).issubset(set(raw.index)))
                 self.assertEqual(result.attrs["missing_columns"], [])
                 self.assertEqual(result.attrs["mode"], mode)
-                print(f"\nCurrent cohort ({mode}): {len(raw)} rows; {len(result)} review observations.")
-                print(result.groupby(["check", "category"]).size().to_string())
 
 
 if __name__ == "__main__":
